@@ -1,6 +1,8 @@
 # csdn-mcp
 
-用 Go 实现的 **CSDN MCP Server**，让大模型（Claude / Cursor / 你自己的 Agent）能够查询 CSDN 文章、并以**用户自己上传的 Cookie** 创建草稿、发布文章。
+## 项目简介
+
+csdn-mcp 是一个**本地运行**的 CSDN MCP Server，核心定位是**帮你打理已经写好的文章**：一句话就能改标题、润色正文、重排 Markdown 表格与代码块、补标签、修正已发布文章的排版问题，也能把草稿安全发布或下线。它不是"代写机器人"——你产出内容与观点，它把繁琐的编辑与发布操作自动化。所有写操作都走你自己的账号（自我委托模式），以 stdio 方式本地运行，没有网络监听。
 
 技术栈：[mark3labs/mcp-go](https://github.com/mark3labs/mcp-go)。单二进制，**固定以 stdio 本地运行**（客户端直接拉起子进程通信，无网络监听）。
 
