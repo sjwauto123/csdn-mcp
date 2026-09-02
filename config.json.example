@@ -1,0 +1,12 @@
+{
+  "server": {
+    "name": "csdn-mcp",
+    "version": "0.1.0"
+  },
+  "csdn": {
+    "publish_endpoint": "https://bizapi.csdn.net/blog-console-api/v1/postedit/saveArticle",
+    "default_cookie": "",
+    "extra_headers": {},
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  }
+}
