@@ -172,6 +172,7 @@ func publishArticleTool() mcp.Tool {
 		mcp.WithString("description", mcp.Description("文章摘要，最多256字")),
 		mcp.WithString("readType", mcp.Description("public/private，默认 public。注意：CSDN 的 status=0 发布后通常对外可见，private 不能保证不公开")),
 		mcp.WithString("creation_statement", mcp.Description("创作声明：0无/1AI辅助/2网络整合/3个人观点")),
+		mcp.WithString("cover_images", mcp.Description("封面图。单张直接传 URL 字符串；多张传 JSON 数组，例如 [\"url1\",\"url2\"]。省略或空表示不设置封面（保留原封面或自动封面）。实验性：是否生效取决于服务端是否接受非空 cover_images。")),
 		mcp.WithBoolean("dry_run", mcp.Description("只做本地校验并预览，不真正调用 CSDN 接口，默认 false")),
 		mcp.WithBoolean("confirm", mcp.Description("未传 article_id 时，必须显式传 true 才会直接新建并发布；否则自动降级为创建草稿")),
 		mcp.WithString("binding_id", mcp.Description("凭证绑定ID，默认 default")),
@@ -189,6 +190,7 @@ func updateArticleTool() mcp.Tool {
 		mcp.WithString("readType", mcp.Description("public/private，默认 public")),
 		mcp.WithString("type", mcp.Description("original/repost/translated，默认 original")),
 		mcp.WithBoolean("publish", mcp.Description("true=更新后直接正式发布；false=保存为草稿，默认 false")),
+		mcp.WithString("cover_images", mcp.Description("封面图。单张直接传 URL 字符串；多张传 JSON 数组，例如 [\"url1\",\"url2\"]。省略或空表示不修改封面。实验性：是否生效取决于服务端是否接受非空 cover_images。")),
 		mcp.WithString("binding_id", mcp.Description("凭证绑定ID，默认 default")),
 	)
 }
@@ -302,6 +304,12 @@ func publishArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHa
 		tags := sliceArg(args, "tags")
 		description := strArg(args, "description", "")
 		dryRun := boolArg(args, "dry_run")
+		// 中文：cover_images 支持「单个 URL」与「JSON 数组」两种写法，统一解析成 []string；
+		// 空串返回 nil = 不修改封面（服务端保留原封面或按标题自动生成）。
+		coverImages, coverErr := parseCoverImages(strArg(args, "cover_images", ""))
+		if coverErr != nil {
+			return mcp.NewToolResultError(coverErr.Error()), nil
+		}
 
 		// 传了 article_id 时，Title/Content 仍必须提供完整内容：CSDN 的 saveArticle
 		// 是覆盖式接口，缺字段会把原标题/正文清空，且草稿正文无法通过接口读回。
@@ -349,6 +357,7 @@ func publishArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHa
 				PubStatus:         "draft",
 				Description:       description,
 				CreationStatement: cs,
+				CoverImages:       coverImages,
 			})
 			if err != nil {
 				if res != nil {
@@ -374,6 +383,7 @@ func publishArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHa
 			ArticleID:         articleID,
 			Description:       description,
 			CreationStatement: cs,
+			CoverImages:       coverImages,
 		})
 		if err != nil {
 			if res != nil {
@@ -388,6 +398,34 @@ func publishArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHa
 	}
 }
 
+// parseCoverImages 解析 cover_images 参数，兼容两种写法：
+//   - 空字符串            → nil（表示"不修改封面"，由服务端保留原封面）
+//   - 以 "[" 开头         → 按 JSON 数组解析，如 ["url1","url2"]
+//   - 其他非空字符串      → 当作单个 URL
+//
+// 之所以容忍单 URL，是因为绝大多数场景只需一张封面图，让调用方少写引号。
+func parseCoverImages(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if strings.HasPrefix(raw, "[") {
+		var urls []string
+		if err := json.Unmarshal([]byte(raw), &urls); err != nil {
+			return nil, fmt.Errorf("cover_images 不是合法 JSON 数组（示例：[\"https://a.png\",\"https://b.png\"]）: %w", err)
+		}
+		// 过滤空串，避免把 "" 当成一张图发给服务端。
+		out := make([]string, 0, len(urls))
+		for _, u := range urls {
+			if strings.TrimSpace(u) != "" {
+				out = append(out, strings.TrimSpace(u))
+			}
+		}
+		return out, nil
+	}
+	return []string{raw}, nil
+}
+
 func updateArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := req.GetArguments()
@@ -400,6 +438,11 @@ func updateArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHan
 		tags := sliceArg(args, "tags")
 		description := strArg(args, "description", "")
 		publish := boolArg(args, "publish")
+		// 中文：与 publish_article 一致——单 URL 或 JSON 数组都能解析；空串 = 不修改封面。
+		coverImages, coverErr := parseCoverImages(strArg(args, "cover_images", ""))
+		if coverErr != nil {
+			return mcp.NewToolResultError(coverErr.Error()), nil
+		}
 
 		// CSDN 保存接口为整篇覆盖式：title/content 任一为空都会把对应字段清空，
 		// 且草稿正文无法通过接口读回，因此两者必须同时给出完整内容（与 publish_article 一致）。
@@ -423,6 +466,7 @@ func updateArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHan
 			ReadType:    strArg(args, "readType", "public"),
 			ArticleID:   articleID,
 			Description: description,
+			CoverImages: coverImages,
 		}
 		if publish {
 			req2.PubStatus = "published"
