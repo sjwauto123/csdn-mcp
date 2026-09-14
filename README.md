@@ -20,6 +20,7 @@ csdn-mcp 是一个**本地运行**的 CSDN MCP Server，核心定位是**帮你�
 | `delete_article` | 写 | 是 | 软删除文章进回收站（草稿/已发布均可，可恢复）；必须 `confirm=true` 才真正执行，否则只返回预览 |
 | `bind_csdn` | 绑定 | 用户自行提供 | 运行时上传并绑定自己的 Cookie 凭证（仅存内存，不落盘）；可选 `persist=true` 加密落盘（需 `CSDN_KEY` + `CSDN_CREDENTIAL_FILE`）。**注意：`persist` 仅对 `default` 绑定生效，非 default 绑定会被忽略**，否则重启后凭证会错位成 default |
 | `unbind_csdn` | 绑定 | 用户自行提供 | 撤销并清除指定 binding_id 的凭证（仅内存移除，随时找回对账号的控制权） |
+| `upload_image` | 上传 | 是（用户 Cookie） | 把图片上传到 CSDN 图床，返回可外链、浏览器可直接打开的公开 URL（形如 `https://i-blog.csdnimg.cn/direct/<hash>.png`）；走 CSDN 官方两步 OBS 直传流程（申请一次性直传凭证 → 直传华为云 OBS，OBS 服务端自动回调解出图床 URL）；支持本地路径 `image_path` 或远程 `image_url`（自动下载，仅 http/https 且拒绝内网地址）；拿到 URL 后放进正文 `![](URL)` 即可在文章插图 |
 
 > **正文格式**：`create_article` / `update_article` / `publish_article` 的 `content` 接受 **Markdown**，发布时由 [goldmark](https://github.com/yuin/goldmark) 自动渲染为 CSDN 展示用的 HTML（若内容本身已是 HTML，请以 `<` 开头以便正确识别）；原始 Markdown 源码同时存入 `markdowncontent`，保留编辑器内可编辑能力。这样标题 / 表格 / 代码块等才会被正确排版，而非把 `#`、`**` 当成纯文本显示。
 
