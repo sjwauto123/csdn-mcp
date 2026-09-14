@@ -8,13 +8,17 @@
 //   - delete_article : 删除文章（写，软删除进回收站）
 //   - get_article    : 读取公开文章（读，无需凭证）
 //   - bind_csdn      : 上传并绑定用户自己的 Cookie 凭证（自我委托）
+//   - unbind_csdn    : 撤销并清除指定 binding_id 的凭证
+//   - upload_image   : 把图片上传到 CSDN 图床并返回可外链的图床 URL
 package tools
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -35,6 +39,7 @@ func Register(s *server.MCPServer, store *auth.Store, client *csdn.Client) {
 	s.AddTool(getArticleTool(), getArticleHandler(client))
 	s.AddTool(bindTool(), bindHandler(store))
 	s.AddTool(unbindTool(), unbindHandler(store))
+	s.AddTool(uploadImageTool(), uploadImageHandler(store, client))
 }
 
 // ---- 参数辅助 ----
@@ -311,12 +316,12 @@ func publishArticleHandler(store *auth.Store, client *csdn.Client) server.ToolHa
 
 		if dryRun {
 			preview := map[string]any{
-				"dry_run":    true,
-				"action":     map[bool]string{true: "发布已有草稿", false: "新建并发布"}[articleID != ""],
-				"article_id": articleID,
-				"title":      title,
-				"tags":       tags,
-				"read_type":  strArg(args, "readType", "public"),
+				"dry_run":       true,
+				"action":        map[bool]string{true: "发布已有草稿", false: "新建并发布"}[articleID != ""],
+				"article_id":    articleID,
+				"title":         title,
+				"tags":          tags,
+				"read_type":     strArg(args, "readType", "public"),
 				"content_chars": len([]rune(content)),
 				"description":   description,
 				"risks": []string{
@@ -603,5 +608,76 @@ func unbindHandler(store *auth.Store) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("已撤销并清除绑定 %q 的凭证（仅内存移除；若曾加密落盘，请另行删除对应文件）。", id)), nil
+	}
+}
+
+// uploadImageTool 定义 upload_image 工具的 schema（名称、参数、说明）。
+// 中文：MCP 工具的 Description 字段会原样作为「大模型看到的使用说明」渲染给客户端，
+// 因此用一段连贯中文描述工作流，把参数约束（image_path / image_url 二选一、拒绝内网）
+// 和常见用法（拿到 URL 后 ![](URL) 插图）写在描述里。
+func uploadImageTool() mcp.Tool {
+	return mcp.NewTool("upload_image",
+		mcp.WithDescription("把一张图片上传到 CSDN 图床，返回可在博客中直接引用的图床 URL（形如 https://img-blog.csdnimg.cn/...）。拿到 URL 后，把它放进 create_article / publish_article 的 content 正文里，用 Markdown 语法 ![](URL) 即可插入图片。支持两种来源：本地图片路径（image_path）或远程图片 URL（image_url），二选一。需要用户自己的 Cookie 凭证（自我委托模式）。"),
+		mcp.WithString("image_path", mcp.Description("本地图片文件路径（与 image_url 二选一），例如 /tmp/diagram.png")),
+		mcp.WithString("image_url", mcp.Description("远程图片 URL（与 image_path 二选一），会自动下载后上传到 CSDN 图床；仅支持 http/https，且拒绝内网地址")),
+		mcp.WithString("binding_id", mcp.Description("凭证绑定ID，默认 default")),
+	)
+}
+
+// uploadImageHandler 是 upload_image 工具的请求处理函数。
+// 中文：流程=取凭证 → 二选一（远程下载/本地读文件）→ 调 UploadImage 上图床 → 把 URL 拼成
+// 「直接可用的 Markdown 图片语法」作为 usage 字段返回，方便模型下一步拼进正文。
+func uploadImageHandler(store *auth.Store, client *csdn.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := req.GetArguments()
+		cred, err := getCred(store, args)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		pathArg := strArg(args, "image_path", "")
+		urlArg := strArg(args, "image_url", "")
+		if pathArg == "" && urlArg == "" {
+			return mcp.NewToolResultError("image_path 与 image_url 至少提供一个"), nil
+		}
+
+		var data []byte
+		var filename, ctype string
+		switch {
+		case urlArg != "":
+			// 中文：image_url 走远程下载分支，内部已做 SSRF 防护（拒绝内网/环回）。
+			data, filename, err = client.DownloadImageForUpload(ctx, urlArg)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		default:
+			// 本地文件：防止把 URL 误传给路径参数。
+			// 中文：模型有时会把 https://... 直接塞到 image_path,这里拦截并提示改用 image_url。
+			if strings.HasPrefix(pathArg, "http://") || strings.HasPrefix(pathArg, "https://") || strings.HasPrefix(pathArg, "file://") {
+				return mcp.NewToolResultError("image_path 应为本地文件路径；若传远程图片请用 image_url"), nil
+			}
+			data, err = os.ReadFile(pathArg)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("读取本地图片失败: %v", err)), nil
+			}
+			ctype = http.DetectContentType(data)
+			filename = filepath.Base(pathArg)
+		}
+
+		res, err := client.UploadImage(ctx, cred, data, filename, ctype)
+		if err != nil {
+			// 中文：UploadImage 在 OBS 已落对象但发布未生效时,会同时返回 err 和 res
+			// （res.FilePath 是 OBS 对象 key）——一并回显给模型,方便用户到 CSDN 后台排查。
+			if res != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("%v\n服务端返回: %s", err, jsonText(res))), nil
+			}
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		out := map[string]any{
+			"url":          res.URL,
+			"usage":        "把该 URL 以 Markdown 图片语法 ![](" + res.URL + ") 放入正文即可在文章中显示",
+			"raw_response": res.Raw,
+		}
+		return mcp.NewToolResultText(jsonText(out)), nil
 	}
 }
