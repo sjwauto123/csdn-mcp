@@ -2,8 +2,10 @@
 csdn-mcp
 csdn-mcp.exe
 csdn-mcp.exe~
+csdn-mcp.exe.new
 *.exe
 *.exe~
+*.exe.new
 
 # 本地真实配置（可能含 Cookie 等凭证，绝不入库；仅提交 .example）
 config.json
@@ -14,3 +16,6 @@ config.json
 
 # 项目内部记忆与本地临时目录（可能含内部备注，不外发）
 .workbuddy/
+
+# 博客配图与生成中间产物（与 csdn-mcp 项目代码无关，不入库）
+blog-redo-images/
