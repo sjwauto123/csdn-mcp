@@ -23,8 +23,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -49,6 +52,23 @@ const (
 	defaultListEndpoint    = "https://bizapi.csdn.net/blog/phoenix/console/v1/article/list"
 	defaultDeleteEndpoint  = "https://blog.csdn.net/phoenix/web/v1/articleListApi/del"
 	defaultArticleURLFmt   = "https://blog.csdn.net/%s/article/details/%s"
+
+	// 图片上传（图床）走 CSDN 官方两步流程（已从 CSDN 编辑器前端 csdn-upload.js 与
+	// md 编辑器 app chunk 反编译确认）：
+	//   1) 先向 bizapi 申请一次性 OBS 直传凭证（policy/signature/accessId/customParam…）；
+	//   2) 再把图片 multipart 直传到华为云 OBS（provider=obs），OBS 回 200 + ETag 即落库；
+	//   3) 最后把 OBS 对象 key 交给 external/storage 登记，拿回公开图床 URL。
+	// 注意：第 3 步依赖 CSDN 服务端对 OBS 对象的回调用以发布（见 UploadImage 注释）。
+	// 中文补充：图床 = CSDN 给博客提供的图片托管服务；OBS = 华为云对象存储。
+	defaultImageSignatureEndpoint = "https://bizapi.csdn.net/resource-api/v1/image/direct/upload/signature"
+	defaultImageStorageEndpoint   = "https://bizapi.csdn.net/resource-api/v1/image/external/storage"
+	// imageAppName 是 CSDN 图床的应用名（编辑器固定值）。
+	// 中文：申请直传凭证时要把这个 appName 带上，告诉 CSDN 是「博客直传」场景。
+	imageAppName = "direct_blog"
+
+	// maxImageBytes 限制上传图片体积。CSDN 单张约限制 5MB，这里略放宽到 8MB 防误伤。
+	// 中文：本地或远程下载的图片超过这个大小会直接拒绝上传，避免在网关层吃 OOM/超时。
+	maxImageBytes = 8 << 20
 )
 
 // ---- 状态码 ----
@@ -83,7 +103,7 @@ type ArticleRequest struct {
 	// PubStatus: draft / published。
 	PubStatus string
 	// ArticleID 非空时表示“更新已有文章”（is_new=0），否则为新建（is_new=1）。
-	ArticleID string
+	ArticleID         string
 	Description       string
 	CreationStatement int
 }
@@ -139,12 +159,14 @@ type DeleteResult struct {
 
 // Client 是 CSDN HTTP 客户端。
 type Client struct {
-	publishEndpoint string
-	listEndpoint    string
-	deleteEndpoint  string
-	articleURLFmt   string
-	userAgent       string
-	http            *http.Client
+	publishEndpoint      string
+	listEndpoint         string
+	deleteEndpoint       string
+	articleURLFmt        string
+	imageSigEndpoint     string // 图床：申请 OBS 直传凭证 // 中文：第 1 步,拿一次性的上传「通行证」
+	imageStorageEndpoint string // 图床：登记 OBS 对象、拿回公开 URL // 中文：第 3 步,把 OBS 对象登记成可外链的图床图片
+	userAgent            string
+	http                 *http.Client
 	// maxRetries 控制对“可重试错误”（网络抖动 / 5xx / 429）的重试次数。
 	maxRetries int
 }
@@ -158,13 +180,15 @@ func NewClient(publishEndpoint, userAgent string) *Client {
 		userAgent = defaultUA
 	}
 	return &Client{
-		publishEndpoint: publishEndpoint,
-		listEndpoint:    defaultListEndpoint,
-		deleteEndpoint:  defaultDeleteEndpoint,
-		articleURLFmt:   defaultArticleURLFmt,
-		userAgent:       userAgent,
-		http:            &http.Client{Timeout: 30 * time.Second},
-		maxRetries:      2,
+		publishEndpoint:      publishEndpoint,
+		listEndpoint:         defaultListEndpoint,
+		deleteEndpoint:       defaultDeleteEndpoint,
+		articleURLFmt:        defaultArticleURLFmt,
+		imageSigEndpoint:     defaultImageSignatureEndpoint,
+		imageStorageEndpoint: defaultImageStorageEndpoint,
+		userAgent:            userAgent,
+		http:                 &http.Client{Timeout: 30 * time.Second},
+		maxRetries:           2,
 	}
 }
 
@@ -396,7 +420,7 @@ func parseListResult(body []byte) *ListResult {
 		Msg     string `json:"msg"`
 		Data    struct {
 			Count map[string]int `json:"count"`
-			List   []struct {
+			List  []struct {
 				ArticleID string `json:"articleId"`
 				Title     string `json:"title"`
 				PostTime  string `json:"postTime"`
@@ -564,6 +588,437 @@ func (c *Client) DeleteArticle(ctx context.Context, cred *auth.Credential, artic
 		return res, fmt.Errorf("删除失败 code=%d: %s", res.Code, msg)
 	}
 	return res, nil
+}
+
+// ---- 图片上传（图床）----
+
+// ImageResult 是图片上传的归一化结果。
+// 中文：无论走主路径（OBS 回调直接吐 URL）还是兜底路径（external/storage 登记），
+// 最终都给调用方一份统一形态；失败时 FilePath 仍带上，方便人工到 CSDN 后台排查对象是否已落 OBS。
+type ImageResult struct {
+	URL      string `json:"url"`
+	Code     int    `json:"code"`
+	Message  string `json:"message"`
+	FilePath string `json:"file_path,omitempty"` // OBS 对象 key，发布未生效时用于排查
+	Raw      string `json:"raw_response,omitempty"`
+}
+
+// imageSignature 是 /image/direct/upload/signature 返回的 OBS 直传凭证。
+// 中文：这张「通行证」是 OBS 校验请求合法性的依据，只能用一次；客户端拿到后要把
+// 字段原样回填到 multipart 表单里（key/policy/signature/callback…）直传到 Host。
+type imageSignature struct {
+	Provider         string                 `json:"provider"`
+	AccessID         string                 `json:"accessId"`
+	Policy           string                 `json:"policy"`
+	Signature        string                 `json:"signature"`
+	Host             string                 `json:"host"`
+	CallbackURL      string                 `json:"callbackUrl"`
+	FilePath         string                 `json:"filePath"`
+	CallbackBody     string                 `json:"callbackBody"`
+	CallbackBodyType string                 `json:"callbackBodyType"`
+	CustomParam      map[string]interface{} `json:"customParam"`
+	SecurityToken    string                 `json:"securityToken"`
+}
+
+// UploadImage 把一张图片上传到 CSDN 图床，返回可在博客中直接引用的图床 URL。
+// 需要用户自己的 Cookie 凭证。流程（从 CSDN 编辑器前端反编译确认）：
+//
+//  1. 向 bizapi 申请一次性 OBS 直传凭证（policy/signature/accessId/customParam…）；
+//  2. 把图片 multipart 直传到华为云 OBS（provider=obs），OBS 回 200 + ETag 即对象落库；
+//  3. 把 OBS 对象 key 交给 external/storage 登记，拿回公开图床 URL。
+//
+// 注意：第 3 步的公开 URL 依赖 CSDN 服务端对 OBS 对象的回调用（OBS→cb-api）把对象
+// 发布到图床；若该回调用未生效（例如非浏览器/网关未触发），对象会停在 OBS 私有态，
+// 此时本函数会返回 FilePath 并明确报错，而不是编造一个打不开的 URL。
+// 中文补充：UploadImage 是整个 upload_image 工具的主入口；HTTP 调用按本函数串联，
+// 任何一步失败都会冒泡到 MCP 客户端（tools 层）展示给最终用户。
+func (c *Client) UploadImage(ctx context.Context, cred *auth.Credential, data []byte, filename, contentType string) (*ImageResult, error) {
+	if cred == nil || cred.Cookie == "" {
+		return nil, fmt.Errorf("缺少 CSDN 凭证：请先调用 bind_csdn 或配置 CSDN_COOKIE")
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("图片数据为空")
+	}
+	if len(data) > maxImageBytes {
+		return nil, fmt.Errorf("图片过大（%d 字节），CSDN 单张约限制 5MB", len(data))
+	}
+	if contentType == "" {
+		// 没拿到 MIME 时用 Go 标准库按文件头魔数识别，避免 OBS 那边类型校验不过。
+		contentType = http.DetectContentType(data)
+	}
+
+	// 1) 申请 OBS 直传凭证
+	sig, err := c.requestImageSignature(ctx, cred, imageSuffix(filename, contentType))
+	if err != nil {
+		return nil, err
+	}
+
+	// 2) 直传 OBS（对象落库，私有）
+	obsBody, err := c.uploadToOBS(ctx, cred, sig, data, filename, contentType)
+	if err != nil {
+		return nil, err
+	}
+
+	// 若 OBS 把回调结果直接回传到响应体（生产环境常见），优先直接取 URL。
+	// 中文：生产环境下 OBS 会同步触发 cb-api 回调，把 {url} 直接放进 OBS 的 HTTP 响应体，
+	// 客户端不用再调第 3 步；这是「主路径」。
+	if url := extractImageURL(obsBody); url != "" {
+		return &ImageResult{URL: url, Code: 200, FilePath: sig.FilePath, Raw: truncate(string(obsBody), maxRawLen)}, nil
+	}
+
+	// 3) 登记并拿回公开 URL（编辑器即 transferImg -> external/storage）
+	// 中文：OBS 偶尔不会同步回传回调结果（对象停在私有态），此时主动调 external/storage
+	// 让 CSDN 把对象登记为公开图床图；这是「兜底路径」。
+	url, raw, err := c.registerImage(ctx, cred, sig)
+	if err != nil {
+		// 中文：兜底路径也失败时，把 OBS 端已有的对象 key 一并返回，方便用户到 CSDN 后台
+		// 找到这张图手动重发或删除，绝不伪造一个看似能打开的图床地址。
+		return &ImageResult{
+			Code:     500,
+			Message:  "图片已上传至 CSDN OBS，但服务端未返回公开图床 URL（发布回调用未生效）",
+			FilePath: sig.FilePath,
+			Raw:      truncate(string(obsBody), maxRawLen),
+		}, fmt.Errorf("CSDN 图片发布失败：%s（OBS key=%s）", err, sig.FilePath)
+	}
+	return &ImageResult{URL: url, Code: 200, FilePath: sig.FilePath, Raw: raw}, nil
+}
+
+// imageSuffix 从文件名或 MIME 推断图片后缀（不含点），供 signature 的 imageSuffix 字段使用。
+// 中文：OBS 凭证里要带后缀，CSDN 据此生成 filePath；优先按文件扩展名猜，否则按 MIME。
+func imageSuffix(filename, contentType string) string {
+	if ext := path.Ext(filename); ext != "" {
+		return strings.TrimPrefix(ext, ".")
+	}
+	switch {
+	case strings.Contains(contentType, "png"):
+		return "png"
+	case strings.Contains(contentType, "jpeg"), strings.Contains(contentType, "jpg"):
+		return "jpg"
+	case strings.Contains(contentType, "gif"):
+		return "gif"
+	case strings.Contains(contentType, "webp"):
+		return "webp"
+	case strings.Contains(contentType, "bmp"):
+		return "bmp"
+	}
+	return "png"
+}
+
+// requestImageSignature 申请一次性 OBS 直传凭证（x-ca 网关签名）。
+// 中文：这是图床上传的第 1 步，相当于「申请一张一次性的 OBS 直传通行证」；
+// 凭证里包含 policy（策略）、signature（OBS 校验用的 HMAC）、filePath（对象 key 模板）。
+func (c *Client) requestImageSignature(ctx context.Context, cred *auth.Credential, suffix string) (*imageSignature, error) {
+	method := http.MethodPost
+	accept := "application/json, text/plain, */*"
+	ctype := "application/json;charset=UTF-8"
+	payload, _ := json.Marshal(map[string]string{
+		"imageTemplate": "",
+		"appName":       imageAppName,
+		"imageSuffix":   suffix,
+	})
+	path := stripHost(c.imageSigEndpoint)
+	h := c.baseHeaders(cred)
+	h.Set("Content-Type", ctype)
+	h.Set("Accept", accept)
+	h.Set("Referer", "https://editor.csdn.net/md/")
+	sts := buildStringToSign(method, path, accept, ctype, "", nil, h)
+	h.Set("X-Ca-Signature", computeHMAC(sts))
+	h.Set("X-Ca-Signature-Headers", "x-ca-key,x-ca-nonce")
+
+	respBody, statusCode, err := c.doWithRetry(ctx, method, c.imageSigEndpoint, h, payload, false)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("CSDN 图床凭证接口返回 %d: %s", statusCode, truncate(string(respBody), 500))
+	}
+	var generic struct {
+		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &generic); err != nil {
+		return nil, fmt.Errorf("解析图床凭证响应失败: %w", err)
+	}
+	if generic.Code != 200 || len(generic.Data) == 0 {
+		return nil, fmt.Errorf("CSDN 图床凭证接口业务错误 code=%d: %s", generic.Code, generic.Msg)
+	}
+	var sig imageSignature
+	if err := json.Unmarshal(generic.Data, &sig); err != nil {
+		return nil, fmt.Errorf("解析图床凭证数据失败: %w", err)
+	}
+	if sig.Host == "" || sig.FilePath == "" || sig.Policy == "" || sig.Signature == "" {
+		return nil, fmt.Errorf("CSDN 图床凭证不完整（缺少 host/filePath/policy/signature）")
+	}
+	return &sig, nil
+}
+
+// uploadToOBS 把图片 multipart 直传到华为云 OBS。该请求是到 OBS 域名的纯表单上传，
+// 不带 x-ca 网关签名（凭证已在表单字段 policy/signature/AccessKeyId 中）。
+// 中文：图床第 2 步。本函数把 imageSignature 凭证按 OBS/OSS 两种 provider 的字段约定
+// 拼成 multipart 表单，把图片二进制塞到 file 字段直传到 sig.Host；这一步只要 HTTP 200
+// 就视为对象已落 OBS（私有态），无需关心响应内容——回调结果由 UploadImage 后续解析。
+func (c *Client) uploadToOBS(ctx context.Context, cred *auth.Credential, sig *imageSignature, data []byte, filename, contentType string) ([]byte, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+
+	// flat 是写表单字段的小工具，把 (name, value) 写成 multipart 一行。
+	flat := func(name, value string) error {
+		return w.WriteField(name, value)
+	}
+	if err := flat("key", sig.FilePath); err != nil {
+		return nil, err
+	}
+	if err := flat("policy", sig.Policy); err != nil {
+		return nil, err
+	}
+	if err := flat("signature", sig.Signature); err != nil {
+		return nil, err
+	}
+	if err := flat("callbackBody", sig.CallbackBody); err != nil {
+		return nil, err
+	}
+	if err := flat("callbackBodyType", sig.CallbackBodyType); err != nil {
+		return nil, err
+	}
+	if sig.Provider == "obs" {
+		// 中文：OBS（华为云）分支：回调用 callbackUrl + AccessKeyId + 可选 STS token。
+		if err := flat("callbackUrl", sig.CallbackURL); err != nil {
+			return nil, err
+		}
+		if err := flat("AccessKeyId", sig.AccessID); err != nil {
+			return nil, err
+		}
+		if sig.SecurityToken != "" {
+			// 中文：仅临时 STS 凭证才会带 securityToken；长期 AK/SK 场景该字段为空。
+			if err := flat("x-amz-security-token", sig.SecurityToken); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		// 中文：OSS（阿里云）分支：回调字段名不一样（callback / OSSAccessKeyId），
+		// 还要带 success_action_status=200 让 OBS 把响应体写成正常 JSON。
+		if err := flat("callback", sig.CallbackURL); err != nil {
+			return nil, err
+		}
+		if err := flat("OSSAccessKeyId", sig.AccessID); err != nil {
+			return nil, err
+		}
+		if err := flat("success_action_status", "200"); err != nil {
+			return nil, err
+		}
+	}
+	for k, v := range sig.CustomParam {
+		// 中文：CSDN 自定义回调字段统一加 x: 前缀，回调时一并回写到 cb-api。
+		if err := flat("x:"+k, fmt.Sprintf("%v", v)); err != nil {
+			return nil, err
+		}
+	}
+	fw, err := w.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	body := buf.Bytes()
+	ct := w.FormDataContentType()
+
+	// OBS 直传到独立域名，仅需 Content-Type / Accept，不带 x-ca 与 Cookie。
+	// 中文：这一步到的是 OBS 域名（不在 CSDN 网关后面），所以不需要 CSDN 的 x-ca 网关签名，
+	// 也不应该带 Cookie（避免把用户凭证泄漏给 OBS 域）。
+	h := make(http.Header)
+	h.Set("Content-Type", ct)
+	h.Set("Accept", "*/*")
+
+	respBody, statusCode, err := c.doWithRetry(ctx, http.MethodPost, sig.Host, h, body, false)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("CSDN OBS 直传返回 %d: %s", statusCode, truncate(string(respBody), 500))
+	}
+	return respBody, nil
+}
+
+// registerImage 调用 external/storage 把 OBS 对象登记为公开图床图片，返回公开 URL。
+// 中文：图床第 3 步（兜底路径）。OBS 直传后没同步回传 URL 时，主动告诉 CSDN「这个 OBS 对象
+// key 就是我刚上传的那张图，请登记成公开图床图」；CSDN 会在内部把对象发布到 img-blog 子域。
+func (c *Client) registerImage(ctx context.Context, cred *auth.Credential, sig *imageSignature) (string, string, error) {
+	method := http.MethodPost
+	accept := "application/json, text/plain, */*"
+	ctype := "application/json;charset=UTF-8"
+	payload, _ := json.Marshal(map[string]interface{}{
+		"uniqueId":  fmt.Sprintf("csdn-mcp_%s", uuidV4()),
+		"imgUrl":    sig.FilePath,
+		"type":      "blog",
+		"rtype":     "article",
+		"isCrawler": 0,
+		"nocache":   2,
+	})
+	path := stripHost(c.imageStorageEndpoint)
+	h := c.baseHeaders(cred)
+	h.Set("Content-Type", ctype)
+	h.Set("Accept", accept)
+	h.Set("Referer", "https://editor.csdn.net/md/")
+	sts := buildStringToSign(method, path, accept, ctype, "", nil, h)
+	h.Set("X-Ca-Signature", computeHMAC(sts))
+	h.Set("X-Ca-Signature-Headers", "x-ca-key,x-ca-nonce")
+
+	respBody, statusCode, err := c.doWithRetry(ctx, method, c.imageStorageEndpoint, h, payload, false)
+	if err != nil {
+		return "", "", err
+	}
+	if statusCode != http.StatusOK {
+		return "", "", fmt.Errorf("CSDN 图床登记接口返回 %d: %s", statusCode, truncate(string(respBody), 500))
+	}
+	url := extractImageURL(respBody)
+	if url == "" {
+		return "", truncate(string(respBody), maxRawLen), fmt.Errorf("登记接口未返回 url（原文: %s）", truncate(string(respBody), 300))
+	}
+	return url, truncate(string(respBody), maxRawLen), nil
+}
+
+// extractImageURL 从 CSDN 响应体里尽量取出图床 URL（data.url / data.imageUrl / 嵌套）。
+// 中文：CSDN 不同接口（OBS 回调 / external/storage / 老的 saveImage）的 data 字段形态不同
+// （有的 url，有的 imageUrl，有的包一层），本函数只做「够用就行」的兜底解析。
+func extractImageURL(body []byte) string {
+	var generic struct {
+		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &generic); err != nil {
+		return ""
+	}
+	if len(generic.Data) == 0 {
+		return ""
+	}
+	var obj struct {
+		URL      string `json:"url"`
+		ImageURL string `json:"imageUrl"`
+	}
+	if json.Unmarshal(generic.Data, &obj) == nil {
+		if obj.URL != "" {
+			return obj.URL
+		}
+		if obj.ImageURL != "" {
+			return obj.ImageURL
+		}
+	}
+	return ""
+}
+
+// DownloadImageForUpload 下载远程图片到内存，供后续 UploadImage 上传到 CSDN 图床。
+// 做轻量 SSRF 防护：仅允许 http/https，且拒绝指向内网/环回地址的主机。
+// 中文：当 upload_image 工具传入的是 image_url（远程）而不是 image_path（本地）时，
+// 先把远程图片拉下来塞进内存，再交给 UploadImage 走图床流程；为防工具被滥用探测内网，
+// 拒绝 127.x / 10.x / 192.168.x / 172.16-31.x 这类私网/环回地址。
+func (c *Client) DownloadImageForUpload(ctx context.Context, rawURL string) ([]byte, string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("image_url 非法: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, "", fmt.Errorf("image_url 仅支持 http/https，收到 %q", u.Scheme)
+	}
+	// SSRF 防护：拒绝内网/环回字面量 IP。域名（如 localhost）无法静态判定，放行。
+	if host := u.Hostname(); isPrivateHost(host) {
+		return nil, "", fmt.Errorf("image_url 指向内网/环回地址，已拒绝: %s", host)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "image/*,*/*")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("下载图片返回 %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > maxImageBytes {
+		return nil, "", fmt.Errorf("图片过大（%d 字节），CSDN 单张约限制 5MB", len(data))
+	}
+	ctype := resp.Header.Get("Content-Type")
+	if ctype == "" || !strings.HasPrefix(ctype, "image/") {
+		ctype = http.DetectContentType(data)
+	}
+	fn := path.Base(u.Path)
+	if fn == "" || fn == "/" {
+		fn = "image.png"
+	}
+	return data, fn, nil
+}
+
+// isPrivateHost 判断主机是否为环回/私网/未指定地址（SSRF 防护）。
+// 仅对 IP 字面量做静态判定；域名无法静态判断，放行（由 CSDN 网关/用户自行负责）。
+// 中文：host 可能带端口（127.0.0.1:8080），先剥掉端口再解析；
+// IsLoopback 拦 127.x、IsPrivate 拦 10/172.16-31/192.168、IsUnspecified 拦 0.0.0.0。
+func isPrivateHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified()
+}
+
+// parseImageUploadResult 兼容 CSDN 图片上传的多种响应结构，尽量提取图床 URL。
+// 可能形态：data 为对象含 url / 字符串型 url / 含 url 的对象数组。
+// 中文：与 extractImageURL 类似但更宽松——也兼容「data 是裸 URL」「data 是 [{...}]」等历史接口形态，
+// 主要给单元测试和老 saveImage 兼容路径用，不参与当前主路径的 UploadImage。
+func parseImageUploadResult(body []byte) *ImageResult {
+	res := &ImageResult{Raw: truncate(string(body), maxRawLen)}
+	var generic struct {
+		Code    int             `json:"code"`
+		Msg     string          `json:"msg"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &generic); err != nil {
+		return res
+	}
+	res.Code = generic.Code
+	if generic.Msg != "" {
+		res.Message = generic.Msg
+	} else {
+		res.Message = generic.Message
+	}
+	if len(generic.Data) == 0 {
+		return res
+	}
+	var obj struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(generic.Data, &obj) == nil && obj.URL != "" {
+		res.URL = obj.URL
+		return res
+	}
+	var arr []struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(generic.Data, &arr) == nil && len(arr) > 0 {
+		res.URL = arr[0].URL
+		return res
+	}
+	var str string
+	if json.Unmarshal(generic.Data, &str) == nil && str != "" {
+		res.URL = str
+	}
+	return res
 }
 
 // ---- 读：公开文章 ----
