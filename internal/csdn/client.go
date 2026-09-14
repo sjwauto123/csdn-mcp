@@ -102,10 +102,14 @@ type ArticleRequest struct {
 	ReadType string
 	// PubStatus: draft / published。
 	PubStatus string
-	// ArticleID 非空时表示“更新已有文章”（is_new=0），否则为新建（is_new=1）。
+	// ArticleID 非空时表示"更新已有文章"（is_new=0），否则为新建（is_new=1）。
 	ArticleID         string
 	Description       string
 	CreationStatement int
+	// CoverImages 封面图 URL 列表。空表示不修改封面（CSDN 保留原封面）。
+	// 单张时传 []string{"url"}；三图模式（cover_type=2）可传多张。
+	// 是否真生效需要服务端校验——这是首次引入的实验性字段。
+	CoverImages []string
 }
 
 // PublishResult 是对 CSDN 写接口响应的归一化结果。
@@ -259,6 +263,10 @@ func (c *Client) Publish(ctx context.Context, cred *auth.Credential, req Article
 	}
 
 	htmlContent, markdownContent := renderArticleContent(req.Content)
+	// 中文：下面这个 body 就是 saveArticle 的请求体，字段缺失会导致「假成功」（返回字符串
+	// "成功" 但不落库）。关于封面图：CoverImages 由调用方透传（原先写死为空数组，等于永远不设
+	// 封面），nil/空表示不修改封面、由 CSDN 保留原封面；CoverType 固定 1 = 单图模式（2 为三图
+	// 模式，尚未启用）。
 	body := saveArticleBody{
 		Title:             req.Title,
 		Content:           htmlContent,
@@ -273,7 +281,7 @@ func (c *Client) Publish(ctx context.Context, cred *auth.Credential, req Article
 		AuthorizedStatus:  false,
 		NotAutoSaved:      "1",
 		Source:            "pc_mdeditor",
-		CoverImages:       []string{},
+		CoverImages:       req.CoverImages,
 		CoverType:         1,
 		IsNew:             isNew,
 		VoteID:            0,
