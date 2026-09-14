@@ -8,10 +8,17 @@ package csdn
 // 用 go test ./... 运行。
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"csdn-mcp/internal/auth"
 )
 
 // ---- 1. 签名 ----
@@ -335,10 +342,10 @@ func TestValidateArticleRef(t *testing.T) {
 	}{
 		{"someuser", "123456", true},
 		{"user_name-1", "164262209", true},
-		{"x@evil.com", "123", false},        // SSRF：@ 把 host 改成 evil.com
-		{"user/../other", "123", false},     // 路径注入
-		{"user space", "123", false},        // 含空白
-		{"user", "abc", false},              // article_id 非数字
+		{"x@evil.com", "123", false},    // SSRF：@ 把 host 改成 evil.com
+		{"user/../other", "123", false}, // 路径注入
+		{"user space", "123", false},    // 含空白
+		{"user", "abc", false},          // article_id 非数字
 		{"", "123", false},
 		{"user", "", false},
 	}
@@ -370,5 +377,186 @@ func TestTruncateRune(t *testing.T) {
 	// 截断后字符串必须是合法 UTF-8（按 rune 截断保证这一点），且至少含前 2 个 rune。
 	if len([]rune(got2)) < 2 {
 		t.Errorf("截断后 rune 数异常: %q", got2)
+	}
+}
+
+// ---- 5. 图片上传 ----
+
+// TestParseImageUploadResult 覆盖响应解析的多种形态。
+// 中文：单元测试直接喂 JSON 字符串，验证 parseImageUploadResult 能正确处理
+// data 是「对象含 url」「裸 URL 字符串」「URL 数组」三种形态,以及业务错误时返回空 URL。
+func TestParseImageUploadResult(t *testing.T) {
+	// data 为对象含 url
+	// 中文:CSDN 接口最常见的响应形态。
+	res := parseImageUploadResult([]byte(`{"code":200,"msg":"success","data":{"url":"https://img-blog.csdnimg.cn/abc.png"}}`))
+	if res.URL != "https://img-blog.csdnimg.cn/abc.png" || res.Code != 200 {
+		t.Fatalf("对象 url 解析失败: %+v", res)
+	}
+	// 字符串型 url
+	// 中文:部分老接口直接返回裸 URL。
+	res = parseImageUploadResult([]byte(`{"code":200,"data":"https://img-blog.csdnimg.cn/x.png"}`))
+	if res.URL != "https://img-blog.csdnimg.cn/x.png" {
+		t.Fatalf("字符串 url 解析失败: %+v", res)
+	}
+	// 数组
+	// 中文:多图上传时 data 是数组形态。
+	res = parseImageUploadResult([]byte(`{"code":200,"data":[{"url":"https://img-blog.csdnimg.cn/a.png"}]}`))
+	if res.URL != "https://img-blog.csdnimg.cn/a.png" {
+		t.Fatalf("数组 url 解析失败: %+v", res)
+	}
+	// 业务错误
+	// 中文:code != 200 时 URL 应为空,不应误把 msg 当 URL。
+	res = parseImageUploadResult([]byte(`{"code":400,"msg":"上传失败"}`))
+	if res.Code != 400 || res.URL != "" {
+		t.Fatalf("业务错误解析异常: %+v", res)
+	}
+}
+
+// TestUploadImageServer 覆盖两步图床流程的"主路径":OBS 直传后把 cb-api 回调结果
+// 回传到响应体(生产环境真实行为),客户端应直接取该 URL、不再调用 external/storage。
+// 中文:用 httptest 起三个本地 HTTP 服务(stub sig / stub OBS / stub storage),
+// 模拟「OBS 把回调结果回写到响应体」的真实行为;验证 UploadImage 主路径直接拿 URL。
+func TestUploadImageServer(t *testing.T) {
+	// OBS 直传服务:对象落库后回传回调结果(data.imageUrl)。
+	// 中文:模拟华为云 OBS——收到 multipart 后校验 file 字段存在,然后返回带 imageUrl 的 JSON。
+	obsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ct := r.Header.Get("Content-Type")
+		if !strings.HasPrefix(ct, "multipart/form-data") {
+			t.Errorf("OBS Content-Type 应为 multipart: %q", ct)
+		}
+		boundary := ct[strings.Index(ct, "boundary=")+len("boundary="):]
+		mr := multipart.NewReader(r.Body, boundary)
+		gotFile := false
+		for {
+			p, err := mr.NextPart()
+			if err != nil {
+				break
+			}
+			if p.FormName() == "file" {
+				gotFile = true
+				io.Copy(io.Discard, p)
+			}
+		}
+		if !gotFile {
+			t.Error("OBS 请求缺少 file 字段")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"code":200,"msg":"success","data":{"imageUrl":"https://img-blog.csdnimg.cn/abc.png"}}`))
+	}))
+	defer obsSrv.Close()
+
+	// 凭证服务:返回指向 obsSrv 的 OBS 一次性直传凭证。
+	// 中文:把 Host 指向本测试起的 OBS 服务,让客户端把图片 multipart 直传到 obsSrv。
+	sigSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		sigData := imageSignature{
+			Provider:         "obs",
+			AccessID:         "AKID",
+			Policy:           "pol",
+			Signature:        "sig",
+			Host:             obsSrv.URL,
+			CallbackURL:      "https://cb-api.csdn.net/x",
+			FilePath:         "2024/01/01/abc.png",
+			CallbackBody:     "{}",
+			CallbackBodyType: "application/json",
+			CustomParam:      map[string]interface{}{},
+		}
+		body, _ := json.Marshal(map[string]interface{}{"code": 200, "msg": "success", "data": sigData})
+		w.Write(body)
+	}))
+	defer sigSrv.Close()
+
+	// storage 不应被调用(OBS 已回传 URL),用非法地址以便万一被调用时立即失败。
+	// 中文:127.0.0.1:0 是非法端口——主路径走通时 storage 永远不被请求,
+	// 万一被请求了会立即 dial 失败,让测试报错。
+	c := NewClient("", "")
+	c.imageSigEndpoint = sigSrv.URL
+	c.imageStorageEndpoint = "http://127.0.0.1:0/unused-storage"
+	res, err := c.UploadImage(context.Background(), &auth.Credential{Cookie: "x"}, []byte("fake-image-bytes"), "demo.png", "image/png")
+	if err != nil {
+		t.Fatalf("UploadImage 失败: %v", err)
+	}
+	if res.URL != "https://img-blog.csdnimg.cn/abc.png" {
+		t.Errorf("URL 错误: %q", res.URL)
+	}
+	if res.FilePath != "2024/01/01/abc.png" {
+		t.Errorf("FilePath 错误: %q", res.FilePath)
+	}
+}
+
+// TestUploadImageServerStorageFallback 覆盖"兜底路径":OBS 不回传 URL(私有态),
+// 客户端应把 OBS key 交给 external/storage 登记并取回公开 URL。
+// 中文:与主路径测试的关键区别是 OBS 返回空 body——模拟「对象停在私有态」的真实场景,
+// 此时客户端必须主动调 external/storage 拿 URL,测试通过 storageCalled 标记验证。
+func TestUploadImageServerStorageFallback(t *testing.T) {
+	// OBS 直传服务:返回空响应体(无回调结果)。
+	// 中文:模拟 OBS 不触发 cb-api 回调的私有态场景。
+	obsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// 空 body,模拟对象私有、未发布
+	}))
+	defer obsSrv.Close()
+
+	// 凭证服务。
+	sigSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		sigData := imageSignature{
+			Provider:         "obs",
+			AccessID:         "AKID",
+			Policy:           "pol",
+			Signature:        "sig",
+			Host:             obsSrv.URL,
+			CallbackURL:      "https://cb-api.csdn.net/x",
+			FilePath:         "2024/01/01/abc.png",
+			CallbackBody:     "{}",
+			CallbackBodyType: "application/json",
+			CustomParam:      map[string]interface{}{},
+		}
+		body, _ := json.Marshal(map[string]interface{}{"code": 200, "msg": "success", "data": sigData})
+		w.Write(body)
+	}))
+	defer sigSrv.Close()
+
+	// 登记服务:external/storage 返回公开 URL。
+	// 中文:storageSrv 是兜底路径的最后一站——客户端把 OBS key 交给它,期望拿到可外链的图床 URL。
+	storageCalled := false
+	storageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"code":200,"msg":"success","data":{"url":"https://img-blog.csdnimg.cn/reg.png"}}`))
+	}))
+	defer storageSrv.Close()
+
+	c := NewClient("", "")
+	c.imageSigEndpoint = sigSrv.URL
+	c.imageStorageEndpoint = storageSrv.URL
+	res, err := c.UploadImage(context.Background(), &auth.Credential{Cookie: "x"}, []byte("fake-image-bytes"), "demo.png", "image/png")
+	if err != nil {
+		t.Fatalf("UploadImage 失败: %v", err)
+	}
+	if !storageCalled {
+		t.Error("OBS 未回传 URL 时应调用 external/storage 兜底")
+	}
+	if res.URL != "https://img-blog.csdnimg.cn/reg.png" {
+		t.Errorf("兜底 URL 错误: %q", res.URL)
+	}
+}
+
+// TestIsPrivateHost 是 SSRF 防护的静态判定单元测试。
+// 中文:覆盖环回(127.x)/私网(10.x、192.168.x)/公网 IP/域名四种情形,
+// 验证 isPrivateHost 仅对 IP 字面量返回 true,域名一律放行(无法静态判定)。
+func TestIsPrivateHost(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1":           true,
+		"localhost":           false, // 域名无法静态判定,放行(依赖 CSDN 网关)
+		"10.0.0.5":            true,
+		"192.168.1.1":         true,
+		"8.8.8.8":             false,
+		"img-blog.csdnimg.cn": false,
+	}
+	for h, want := range cases {
+		if got := isPrivateHost(h); got != want {
+			t.Errorf("isPrivateHost(%q) = %v, want %v", h, got, want)
+		}
 	}
 }
