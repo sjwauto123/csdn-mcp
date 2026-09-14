@@ -6,6 +6,8 @@ csdn-mcp.exe.new
 *.exe
 *.exe~
 *.exe.new
+*.exe.new~
+*.exe.bak-*
 
 # 本地真实配置（可能含 Cookie 等凭证，绝不入库；仅提交 .example）
 config.json
